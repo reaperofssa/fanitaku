@@ -488,7 +488,7 @@
             const channelName = channelNames[channelId] || `Channel ${channelId.replace('channel', '')}`;
             document.getElementById('channelName').textContent = channelName;
             
-            const streamUrl = `/hls/${channelId}/master.m3u8`;
+            const streamUrl = `https://newservers-hlb.hf.space/hls/${channelId}/master.m3u8`;
             
             // Prevent auto fullscreen on iOS
             video.setAttribute('playsinline', '');
@@ -561,7 +561,7 @@
         // Load schedule
         async function loadSchedule() {
             try {
-                const response = await fetch(`/api/schedule/${channelId}`);
+                const response = await fetch(`https://newservers-hlb.hf.space/api/schedule/${channelId}`);
                 const schedule = await response.json();
                 currentSchedule = schedule;
                 
