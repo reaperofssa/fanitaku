@@ -117,6 +117,7 @@
             height: 100%;
             background: rgba(0, 0, 0, 0.8);
             display: flex;
+            flex-direction: column;
             align-items: center;
             justify-content: center;
             z-index: 10;
@@ -129,6 +130,14 @@
             border-top: 2px solid #ff1493;
             border-radius: 50%;
             animation: spin 1s linear infinite;
+            margin-bottom: 10px;
+        }
+
+        .loading-text {
+            color: #ff1493;
+            font-size: 12px;
+            font-weight: 600;
+            text-align: center;
         }
 
         @keyframes spin {
@@ -161,6 +170,26 @@
         .control-btn:hover {
             transform: translateY(-1px);
             box-shadow: 0 4px 12px rgba(255, 20, 147, 0.4);
+        }
+
+        .control-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .auto-refresh-indicator {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: rgba(255, 20, 147, 0.8);
+            color: white;
+            padding: 4px 8px;
+            border-radius: 12px;
+            font-size: 10px;
+            font-weight: 600;
+            z-index: 15;
+            display: none;
         }
 
         .now-next-container {
@@ -344,20 +373,6 @@
             font-size: 12px;
         }
 
-        .transition-indicator {
-            position: absolute;
-            top: 10px;
-            right: 10px;
-            background: rgba(255, 20, 147, 0.9);
-            color: white;
-            padding: 5px 10px;
-            border-radius: 15px;
-            font-size: 11px;
-            font-weight: 600;
-            z-index: 15;
-            display: none;
-        }
-
         @media (max-width: 768px) {
             .container {
                 padding: 10px;
@@ -422,9 +437,10 @@
                 </video>
                 <div class="loading-overlay" id="loadingOverlay">
                     <div class="loading-spinner"></div>
+                    <div class="loading-text" id="loadingText">Loading stream...</div>
                 </div>
-                <div class="transition-indicator" id="transitionIndicator">
-                    Switching to next episode...
+                <div class="auto-refresh-indicator" id="autoRefreshIndicator">
+                    Auto-switching to next episode...
                 </div>
             </div>
         </div>
@@ -433,7 +449,7 @@
             <button class="control-btn" onclick="toggleMute()">🔊 Mute</button>
             <button class="control-btn" onclick="toggleFullscreen()">⛶ Full</button>
             <button class="control-btn" onclick="refreshStream()">🔄 Refresh</button>
-            <button class="control-btn" onclick="toggleAutoSwitch()">🔄 Auto: <span id="autoStatus">ON</span></button>
+            <button class="control-btn" id="autoToggle" onclick="toggleAutoRefresh()">🔄 Auto: ON</button>
         </div>
 
         <div class="now-next-container">
@@ -478,13 +494,12 @@
         let channelId;
         let scheduleInterval;
         let currentSchedule = [];
-        let currentEpisodeIndex = 0;
-        let autoSwitchEnabled = true;
-        let isTransitioning = false;
-        let adDetectionTimeout;
-        let episodeEndTimeout;
-        let lastProgressTime = 0;
-        let progressStallCount = 0;
+        let autoRefreshEnabled = true;
+        let streamMonitorInterval;
+        let lastPlayPosition = 0;
+        let stallCount = 0;
+        let episodeEndDetected = false;
+        let refreshInProgress = false;
 
         // Channel name mapping
         const channelNames = {
@@ -508,6 +523,7 @@
             channelId = getChannelId();
             const video = document.getElementById('videoPlayer');
             const loadingOverlay = document.getElementById('loadingOverlay');
+            const loadingText = document.getElementById('loadingText');
             
             // Update channel name with proper mapping
             const channelName = channelNames[channelId] || `Channel ${channelId.replace('channel', '')}`;
@@ -520,11 +536,17 @@
             video.setAttribute('webkit-playsinline', '');
             
             if (Hls.isSupported()) {
+                if (hls) {
+                    hls.destroy();
+                }
+                
                 hls = new Hls({
                     debug: false,
                     enableWorker: true,
                     lowLatencyMode: true,
-                    backBufferLength: 90
+                    backBufferLength: 90,
+                    maxBufferLength: 30,
+                    maxMaxBufferLength: 600
                 });
                 
                 hls.loadSource(streamUrl);
@@ -533,24 +555,57 @@
                 hls.on(Hls.Events.MANIFEST_PARSED, function() {
                     console.log('Manifest loaded, starting playback');
                     loadingOverlay.style.display = 'none';
+                    loadingText.textContent = 'Loading stream...';
+                    refreshInProgress = false;
+                    
+                    // Start monitoring stream for episode transitions
+                    if (autoRefreshEnabled) {
+                        startStreamMonitoring();
+                    }
                 });
                 
                 hls.on(Hls.Events.ERROR, function(event, data) {
+                    console.log('HLS Error:', data);
+                    
                     if (data.fatal) {
                         switch(data.type) {
                             case Hls.ErrorTypes.NETWORK_ERROR:
                                 console.log('Network error, trying to recover...');
-                                hls.startLoad();
+                                loadingText.textContent = 'Network error, recovering...';
+                                setTimeout(() => {
+                                    if (hls) {
+                                        hls.startLoad();
+                                    }
+                                }, 1000);
                                 break;
                             case Hls.ErrorTypes.MEDIA_ERROR:
                                 console.log('Media error, trying to recover...');
-                                hls.recoverMediaError();
+                                loadingText.textContent = 'Media error, recovering...';
+                                setTimeout(() => {
+                                    if (hls) {
+                                        hls.recoverMediaError();
+                                    }
+                                }, 1000);
                                 break;
                             default:
-                                console.log('Fatal error, destroying HLS instance');
-                                hls.destroy();
-                                showError('Stream error occurred. Please refresh the page.');
+                                console.log('Fatal error, will auto-refresh if enabled');
+                                if (autoRefreshEnabled && !refreshInProgress) {
+                                    handleEpisodeTransition();
+                                } else {
+                                    showError('Stream error occurred. Please refresh the page.');
+                                }
                                 break;
+                        }
+                    }
+                });
+                
+                // Monitor for fragment loading issues
+                hls.on(Hls.Events.FRAG_LOAD_EMERGENCY_ABORTED, function() {
+                    console.log('Fragment load emergency aborted - possible episode end');
+                    if (autoRefreshEnabled && !refreshInProgress) {
+                        stallCount++;
+                        if (stallCount >= 3) {
+                            handleEpisodeTransition();
                         }
                     }
                 });
@@ -560,213 +615,152 @@
                 video.src = streamUrl;
                 video.addEventListener('loadedmetadata', function() {
                     loadingOverlay.style.display = 'none';
+                    refreshInProgress = false;
+                    if (autoRefreshEnabled) {
+                        startStreamMonitoring();
+                    }
                 });
             } else {
                 showError('HLS is not supported in this browser.');
             }
             
-            // Enhanced video event listeners for auto-switching
+            // Video event listeners
             video.addEventListener('loadstart', () => {
-                if (!isTransitioning) {
+                if (!refreshInProgress) {
                     loadingOverlay.style.display = 'flex';
+                    loadingText.textContent = 'Loading stream...';
                 }
             });
             
             video.addEventListener('canplay', () => {
                 loadingOverlay.style.display = 'none';
+                stallCount = 0; // Reset stall count on successful play
             });
             
             video.addEventListener('waiting', () => {
-                if (!isTransitioning) {
+                if (!refreshInProgress) {
                     loadingOverlay.style.display = 'flex';
+                    loadingText.textContent = 'Buffering...';
                 }
             });
             
             video.addEventListener('playing', () => {
                 loadingOverlay.style.display = 'none';
-                isTransitioning = false;
-                document.getElementById('transitionIndicator').style.display = 'none';
+                stallCount = 0;
             });
-
-            // Monitor video progress for episode end detection
-            video.addEventListener('timeupdate', handleVideoProgress);
             
-            // Handle video end (fallback)
-            video.addEventListener('ended', handleVideoEnd);
-            
-            // Handle video stalling (potential ad detection)
-            video.addEventListener('stalled', handleVideoStall);
-            video.addEventListener('suspend', handleVideoStall);
-        }
-
-        // Handle video progress and detect episode transitions
-        function handleVideoProgress() {
-            if (!autoSwitchEnabled || isTransitioning) return;
-            
-            const video = document.getElementById('videoPlayer');
-            const currentTime = video.currentTime;
-            const duration = video.duration;
-            
-            // Reset stall counter if video is progressing normally
-            if (currentTime > lastProgressTime) {
-                progressStallCount = 0;
-                lastProgressTime = currentTime;
-            }
-            
-            // Check if we're near the end of an episode (last 30 seconds)
-            if (duration && currentTime > 0 && (duration - currentTime) < 30) {
-                prepareNextEpisode();
-            }
-            
-            // Check for potential episode end based on schedule timing
-            checkScheduleTransition();
-        }
-
-        // Handle video end
-        function handleVideoEnd() {
-            if (autoSwitchEnabled && !isTransitioning) {
-                console.log('Video ended, switching to next episode');
-                switchToNextEpisode();
-            }
-        }
-
-        // Handle video stalling (could indicate ads or transitions)
-        function handleVideoStall() {
-            progressStallCount++;
-            
-            // If video stalls multiple times, it might be transitioning between episodes
-            if (progressStallCount > 3 && autoSwitchEnabled) {
-                console.log('Detected potential episode transition via stalling');
-                
-                // Wait a bit to see if it's just buffering or actual transition
-                setTimeout(() => {
-                    const video = document.getElementById('videoPlayer');
-                    if (video.readyState < 3) { // Not enough data
-                        checkForEpisodeTransition();
+            video.addEventListener('stalled', () => {
+                console.log('Video stalled');
+                if (autoRefreshEnabled && !refreshInProgress) {
+                    stallCount++;
+                    if (stallCount >= 2) {
+                        setTimeout(() => {
+                            if (video.readyState <= 2 && !refreshInProgress) {
+                                handleEpisodeTransition();
+                            }
+                        }, 5000);
                     }
-                }, 2000);
-            }
-        }
-
-        // Check if current time matches schedule transition
-        function checkScheduleTransition() {
-            if (!currentSchedule.length) return;
-            
-            const now = new Date();
-            const currentTime = now.toLocaleTimeString('en-US', { 
-                hour12: false,
-                hour: '2-digit',
-                minute: '2-digit'
-            });
-            
-            // Check if we've moved to the next scheduled program
-            const currentProgram = currentSchedule[currentEpisodeIndex];
-            const nextProgram = currentSchedule[currentEpisodeIndex + 1];
-            
-            if (nextProgram && currentTime >= nextProgram.startTime) {
-                console.log('Schedule indicates episode transition');
-                switchToNextEpisode();
-            }
-        }
-
-        // Prepare for next episode transition
-        function prepareNextEpisode() {
-            if (episodeEndTimeout) return; // Already preparing
-            
-            episodeEndTimeout = setTimeout(() => {
-                if (autoSwitchEnabled && !isTransitioning) {
-                    switchToNextEpisode();
                 }
-                episodeEndTimeout = null;
-            }, 5000); // Wait 5 seconds before switching
+            });
+            
+            video.addEventListener('ended', () => {
+                console.log('Video ended naturally');
+                if (autoRefreshEnabled && !refreshInProgress) {
+                    handleEpisodeTransition();
+                }
+            });
         }
 
-        // Check for episode transition (ad detection)
-        function checkForEpisodeTransition() {
+        // Start monitoring stream for episode transitions
+        function startStreamMonitoring() {
             const video = document.getElementById('videoPlayer');
             
-            // If video is playing but we detected issues, it might be an ad
-            if (!video.paused && video.readyState >= 2) {
-                console.log('Video playing normally, likely an ad - continuing playback');
-                return;
+            if (streamMonitorInterval) {
+                clearInterval(streamMonitorInterval);
             }
             
-            // If video seems stuck, try to switch episode
-            if (autoSwitchEnabled) {
-                switchToNextEpisode();
-            }
-        }
-
-        // Switch to next episode
-        function switchToNextEpisode() {
-            if (isTransitioning) return;
-            
-            isTransitioning = true;
-            const transitionIndicator = document.getElementById('transitionIndicator');
-            transitionIndicator.style.display = 'block';
-            
-            console.log('Switching to next episode...');
-            
-            // Clear any pending timeouts
-            if (episodeEndTimeout) {
-                clearTimeout(episodeEndTimeout);
-                episodeEndTimeout = null;
-            }
-            
-            // Update episode index
-            if (currentSchedule.length > 0) {
-                currentEpisodeIndex = (currentEpisodeIndex + 1) % currentSchedule.length;
-            }
-            
-            // Refresh the stream to get the next episode
-            setTimeout(() => {
-                refreshStreamForNextEpisode();
-            }, 1000);
-        }
-
-        // Refresh stream for next episode
-        function refreshStreamForNextEpisode() {
-            const video = document.getElementById('videoPlayer');
-            const streamUrl = `https://newservers-hlb.hf.space/hls/${channelId}/master.m3u8?t=${Date.now()}`;
-            
-            if (hls) {
-                hls.destroy();
-            }
-            
-            // Reinitialize HLS with new timestamp
-            if (Hls.isSupported()) {
-                hls = new Hls({
-                    debug: false,
-                    enableWorker: true,
-                    lowLatencyMode: true,
-                    backBufferLength: 90
-                });
+            streamMonitorInterval = setInterval(() => {
+                if (refreshInProgress) return;
                 
-                hls.loadSource(streamUrl);
-                hls.attachMedia(video);
+                const currentTime = video.currentTime;
+                const duration = video.duration;
                 
-                hls.on(Hls.Events.MANIFEST_PARSED, function() {
-                    console.log('Next episode loaded');
-                    video.play().catch(e => console.log('Autoplay prevented:', e));
-                });
-                
-                hls.on(Hls.Events.ERROR, function(event, data) {
-                    if (data.fatal) {
-                        console.log('Error loading next episode, retrying...');
-                        setTimeout(() => refreshStreamForNextEpisode(), 3000);
+                // Check if video is stuck at the same position
+                if (currentTime === lastPlayPosition && !video.paused && !video.seeking) {
+                    stallCount++;
+                    console.log(`Stream stall detected. Count: ${stallCount}`);
+                    
+                    if (stallCount >= 5) { // 5 seconds of stalling
+                        console.log('Extended stall detected - likely episode end');
+                        handleEpisodeTransition();
+                        return;
                     }
-                });
-            }
-            
-            // Update schedule to reflect new current episode
-            loadSchedule();
+                } else {
+                    stallCount = 0;
+                }
+                
+                // Check if we're near the end of content and buffering
+                if (duration && currentTime > 0) {
+                    const remainingTime = duration - currentTime;
+                    if (remainingTime < 2 && video.readyState < 4) {
+                        console.log('Near end with insufficient buffer - likely episode end');
+                        handleEpisodeTransition();
+                        return;
+                    }
+                }
+                
+                lastPlayPosition = currentTime;
+                
+            }, 1000); // Check every second
         }
 
-        // Toggle auto-switch functionality
-        function toggleAutoSwitch() {
-            autoSwitchEnabled = !autoSwitchEnabled;
-            document.getElementById('autoStatus').textContent = autoSwitchEnabled ? 'ON' : 'OFF';
-            console.log('Auto-switch:', autoSwitchEnabled ? 'enabled' : 'disabled');
+        // Handle episode transition
+        function handleEpisodeTransition() {
+            if (refreshInProgress) return;
+            
+            refreshInProgress = true;
+            stallCount = 0;
+            
+            console.log('Handling episode transition');
+            
+            const loadingOverlay = document.getElementById('loadingOverlay');
+            const loadingText = document.getElementById('loadingText');
+            const autoRefreshIndicator = document.getElementById('autoRefreshIndicator');
+            
+            // Show transition UI
+            loadingOverlay.style.display = 'flex';
+            loadingText.textContent = 'Switching to next episode...';
+            autoRefreshIndicator.style.display = 'block';
+            
+            // Clear existing monitoring
+            if (streamMonitorInterval) {
+                clearInterval(streamMonitorInterval);
+            }
+            
+            // Wait a moment then reinitialize
+            setTimeout(() => {
+                autoRefreshIndicator.style.display = 'none';
+                initPlayer();
+                loadSchedule(); // Refresh schedule to get updated info
+            }, 2000);
+        }
+
+        // Toggle auto-refresh functionality
+        function toggleAutoRefresh() {
+            autoRefreshEnabled = !autoRefreshEnabled;
+            const autoToggle = document.getElementById('autoToggle');
+            
+            if (autoRefreshEnabled) {
+                autoToggle.textContent = '🔄 Auto: ON';
+                autoToggle.style.background = 'linear-gradient(135deg, #ff1493 0%, #ff69b4 100%)';
+                startStreamMonitoring();
+            } else {
+                autoToggle.textContent = '🔄 Auto: OFF';
+                autoToggle.style.background = 'linear-gradient(135deg, #666 0%, #888 100%)';
+                if (streamMonitorInterval) {
+                    clearInterval(streamMonitorInterval);
+                }
+            }
         }
 
         // Load schedule
@@ -804,7 +798,6 @@
                         scheduleItem.classList.add('current');
                         currentShow = item;
                         nextShow = schedule[index + 1] || null;
-                        currentEpisodeIndex = index;
                     }
                     
                     scheduleItem.innerHTML = `
@@ -889,11 +882,19 @@
 
         function refreshStream() {
             const loadingOverlay = document.getElementById('loadingOverlay');
+            const loadingText = document.getElementById('loadingText');
+            
             loadingOverlay.style.display = 'flex';
+            loadingText.textContent = 'Refreshing stream...';
+            
+            // Disable auto-refresh temporarily during manual refresh
+            const wasAutoEnabled = autoRefreshEnabled;
+            autoRefreshEnabled = false;
             
             setTimeout(() => {
-                window.location.reload();
-            }, 300);
+                initPlayer();
+                autoRefreshEnabled = wasAutoEnabled;
+            }, 500);
         }
 
         function showError(message) {
@@ -926,10 +927,92 @@
             if (scheduleInterval) {
                 clearInterval(scheduleInterval);
             }
-            if (episodeEndTimeout) {
-                clearTimeout(episodeEndTimeout);
+            if (streamMonitorInterval) {
+                clearInterval(streamMonitorInterval);
             }
         });
+
+        // Additional episode end detection methods
+        function detectEpisodeEnd() {
+            const video = document.getElementById('videoPlayer');
+            
+            // Method 1: Check for extended buffering at end
+            if (video.duration && video.currentTime > 0) {
+                const progress = video.currentTime / video.duration;
+                if (progress > 0.95 && video.readyState < 3) {
+                    return true;
+                }
+            }
+            
+            // Method 2: Check for network stalling
+            if (hls && hls.media) {
+                const buffered = hls.media.buffered;
+                if (buffered.length > 0) {
+                    const bufferedEnd = buffered.end(buffered.length - 1);
+                    const currentTime = video.currentTime;
+                    
+                    // If we're close to buffered end and not loading more
+                    if (bufferedEnd - currentTime < 1 && video.readyState < 4) {
+                        return true;
+                    }
+                }
+            }
+            
+            return false;
+        }
+
+        // Enhanced monitoring with multiple detection methods
+        function enhancedStreamMonitoring() {
+            const video = document.getElementById('videoPlayer');
+            
+            if (streamMonitorInterval) {
+                clearInterval(streamMonitorInterval);
+            }
+            
+            let consecutiveStalls = 0;
+            let lastCurrentTime = 0;
+            let episodeEndChecks = 0;
+            
+            streamMonitorInterval = setInterval(() => {
+                if (refreshInProgress || !autoRefreshEnabled) return;
+                
+                const currentTime = video.currentTime;
+                const isPlaying = !video.paused && !video.ended && video.readyState > 2;
+                
+                // Enhanced stall detection
+                if (isPlaying && Math.abs(currentTime - lastCurrentTime) < 0.1) {
+                    consecutiveStalls++;
+                    
+                    if (consecutiveStalls >= 5) { // 5 seconds of stalling
+                        console.log('Extended stall detected - triggering refresh');
+                        handleEpisodeTransition();
+                        return;
+                    }
+                } else {
+                    consecutiveStalls = 0;
+                }
+                
+                // Episode end detection
+                if (detectEpisodeEnd()) {
+                    episodeEndChecks++;
+                    if (episodeEndChecks >= 3) { // 3 consecutive checks
+                        console.log('Episode end detected - triggering refresh');
+                        handleEpisodeTransition();
+                        return;
+                    }
+                } else {
+                    episodeEndChecks = 0;
+                }
+                
+                lastCurrentTime = currentTime;
+                
+            }, 1000);
+        }
+
+        // Override the original monitoring function
+        function startStreamMonitoring() {
+            enhancedStreamMonitoring();
+        }
     </script>
 </body>
 </html>
